@@ -21,7 +21,7 @@
  
  (2)->(3). spark job，通过org.elasticsearch.spark以及相应的search query，获取数据，使用Spark MLlib’s ALS推荐算法进行计算。
  
- (4)->(5). 给出每个user推荐的docker repository,并且将结果保存到es，供展示模块调用读取。
+ (4)->(5). 给出每个user推荐的docker repository,并且将结果保存到es，供展示模块调用读取。步骤（5）中，当一个用户pull了一个logstash的image,我们的推荐系统可能就会推荐elasticsearch, kibana,logstash, logspout, spark等image，因为用户pull过elasticsearch的image，也会pull其他相关的一些image,这些image常常被组合起来使用,所以推荐系统会给出这些推荐建议。
  
 ### Machine Learning: The Alternating Least Squares Recommender Algorithm
 
