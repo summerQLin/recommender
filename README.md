@@ -37,23 +37,29 @@ val model = ALS.trainImplicit(trainData, 10, 5, 0.01, 1.0)
 ```
 import org.apache.spark.rdd._
 
-def areaUnderCurve(
-    positiveData: RDD[Rating],
-    bAllItemIDs: Broadcast[Array[Int]],
-    predictFunction: (RDD[(Int,Int)] => RDD[Rating])) = {
-  ...
-}
+    val allData = buildEventRating(rddevent)
+    val Array(trainData, cvData) = allData.randomSplit(Array(0.9, 0.1))
+    trainData.cache()
+    cvData.cache()
 
-val allData = buildRatings(rawUserArtistData, bArtistAlias) 1
-val Array(trainData, cvData) = allData.randomSplit(Array(0.9, 0.1))
-trainData.cache()
-cvData.cache()
+    val allItemIDs = allData.map(_.product).distinct().collect()
+    val bAllItemIDs = sc.broadcast(allItemIDs)
 
-val allItemIDs = allData.map(_.product).distinct().collect() 2
-val bAllItemIDs = sc.broadcast(allItemIDs)
+    val mostListenedAUC = areaUnderCurve(cvData, bAllItemIDs, predictMostListened(sc, trainData))
+    println(mostListenedAUC)
 
-val model = ALS.trainImplicit(trainData, 10, 5, 0.01, 1.0)
-val auc = areaUnderCurve(cvData, bAllItemIDs, model.predict)
+    val evaluations =
+      for (rank   <- Array(10,  50);
+           lambda <- Array(1.0, 0.0001);
+           alpha  <- Array(1.0, 40.0))
+      yield {
+        val model = ALS.trainImplicit(trainData, rank, 10, lambda, alpha)
+        val auc = areaUnderCurve(cvData, bAllItemIDs, model.predict)
+        unpersist(model)
+        ((rank, lambda, alpha), auc)
+      }
+
+    evaluations.sortBy(_._2).reverse.foreach(println)
 ```
 
 

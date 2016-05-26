@@ -1,9 +1,3 @@
-/*
- * Copyright 2015 Sanford Ryza, Uri Laserson, Sean Owen and Joshua Wills
- *
- * See LICENSE file for further information.
- */
-
 package com.cloudera.datascience.recommender
 
 import scala.collection.Map
@@ -15,25 +9,33 @@ import org.apache.spark.SparkContext._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.mllib.recommendation._
 import org.apache.spark.rdd.RDD
+import org.elasticsearch.spark._
+import org.elasticsearch.spark.sql._
 
-object RunRecommender {
+object Recommender {
 
   def main(args: Array[String]): Unit = {
-    val sc = new SparkContext(new SparkConf().setAppName("Recommender"))
-    val base = if (args.length > 0) args(0).toString else "hdfs:///user/ds/"
-    val rawUserArtistData = sc.textFile(base + "user_artist_data.txt")
-    val rawArtistData = sc.textFile(base + "artist_data.txt")
-    val rawArtistAlias = sc.textFile(base + "artist_alias.txt")
+    val base = if (args.length > 0) args(0).toString else "127.0.0.1:9200"
+    val baseFolder = if (args.length > 0) args(1).toString else "/home/qinglin/Documents/spark/recommender/profiledata_06-May-2005/"
+    var conf = new SparkConf().setAppName("Recommender")
+    conf.set("es.nodes", base)
+    conf.set("es.index.auto.create", "true")
+    val sc = new SparkContext(conf)
 
-    preparation(rawUserArtistData, rawArtistData, rawArtistAlias)
-    model(sc, rawUserArtistData, rawArtistData, rawArtistAlias)
-    evaluate(sc, rawUserArtistData, rawArtistAlias)
-    recommend(sc, rawUserArtistData, rawArtistData, rawArtistAlias)
+    val rddimg = sc.esRDD("demo/images")
+    var rddevent = sc.esRDD("demo/pullevent")
+    //println(rddimg.first())
+    //println(rddevent.first())
+
+    model(sc, rddevent, rddimg)
+    evaluate(sc, rddevent, rddimg)
+    recommend(sc, rddevent, rddimg, base)
   }
 
-  def buildArtistByID(rawArtistData: RDD[String]) =
-    rawArtistData.flatMap { line =>
-      val (id, name) = line.span(_ != '\t')
+  def buildImageByID(rddimg: RDD[(String, scala.collection.Map[String,AnyRef])]) =
+    rddimg.map { record =>
+      val doc = record._2
+      val (id, name) = (doc.get("id").get.asInstanceOf[Int], doc.get("name").get.asInstanceOf[String])
       if (name.isEmpty) {
         None
       } else {
@@ -45,31 +47,20 @@ object RunRecommender {
       }
     }
 
-  def buildArtistAlias(rawArtistAlias: RDD[String]): Map[Int,Int] =
-    rawArtistAlias.flatMap { line =>
-      val tokens = line.split('\t')
-      if (tokens(0).isEmpty) {
+def buildEventsID(rddevent: RDD[(String, scala.collection.Map[String,AnyRef])]) =
+    rddimg.map { record =>
+      val doc = record._2
+      val (userid, imageid, count) = (doc.get("userID").get.asInstanceOf[Int], doc.get("imageID").get.asInstanceOf[Int], doc.get("count").get.asInstanceOf[Int])
+      if (name.isEmpty) {
         None
       } else {
-        Some((tokens(0).toInt, tokens(1).toInt))
+        try {
+          Some((userid.toInt, imageid.toInt, count.toInt))
+        } catch {
+          case e: NumberFormatException => None
+        }
       }
-    }.collectAsMap()
-
-  def preparation(
-      rawUserArtistData: RDD[String],
-      rawArtistData: RDD[String],
-      rawArtistAlias: RDD[String]) = {
-    val userIDStats = rawUserArtistData.map(_.split(' ')(0).toDouble).stats()
-    val itemIDStats = rawUserArtistData.map(_.split(' ')(1).toDouble).stats()
-    println(userIDStats)
-    println(itemIDStats)
-
-    val artistByID = buildArtistByID(rawArtistData)
-    val artistAlias = buildArtistAlias(rawArtistAlias)
-
-    val (badID, goodID) = artistAlias.head
-    println(artistByID.lookup(badID) + " -> " + artistByID.lookup(goodID))
-  }
+    }
 
   def buildRatings(
       rawUserArtistData: RDD[String],
@@ -81,15 +72,25 @@ object RunRecommender {
     }
   }
 
+  def buildEventRating (
+      rddevent: RDD[(String, scala.collection.Map[String,AnyRef])]) = {
+       rddevent.map { record =>
+          val doc = record._2
+          val userID = doc.get("userID").get.asInstanceOf[Int]
+          val imageID = doc.get("imageID").get.asInstanceOf[Int]
+          val count = doc.get("count").get.asInstanceOf[Int]
+        Rating(userID, imageID, count)
+       }
+  }
+
   def model(
       sc: SparkContext,
-      rawUserArtistData: RDD[String],
-      rawArtistData: RDD[String],
-      rawArtistAlias: RDD[String]): Unit = {
+      rddevent: RDD[(String, scala.collection.Map[String,AnyRef])],
+      rddimg: RDD[(String, scala.collection.Map[String,AnyRef])]): Unit = {
 
-    val bArtistAlias = sc.broadcast(buildArtistAlias(rawArtistAlias))
+    //val bArtistAlias = sc.broadcast(buildArtistAlias(rawArtistAlias))
 
-    val trainData = buildRatings(rawUserArtistData, bArtistAlias).cache()
+    val trainData = buildEventRating(rddevent).cache()
 
     val model = ALS.trainImplicit(trainData, 10, 5, 0.01, 1.0)
 
@@ -97,22 +98,24 @@ object RunRecommender {
 
     println(model.userFeatures.mapValues(_.mkString(", ")).first())
 
-    val userID = 2093760
+    val userID = 100
     val recommendations = model.recommendProducts(userID, 5)
     recommendations.foreach(println)
     val recommendedProductIDs = recommendations.map(_.product).toSet
 
-    val rawArtistsForUser = rawUserArtistData.map(_.split(' ')).
+//select events which contains user 100
+    
+    val imageIDS = buildEventsID(rddevent).
       filter { case Array(user,_,_) => user.toInt == userID }
 
-    val existingProducts = rawArtistsForUser.map { case Array(_,artist,_) => artist.toInt }.
+    val existingProducts = imageIDS.map { case Array(_,image,_) => image.toInt }.
       collect().toSet
 
-    val artistByID = buildArtistByID(rawArtistData)
+    val allImageByID = buildImageByID(rddimg)
 
-    artistByID.filter { case (id, name) => existingProducts.contains(id) }.
+    allImageByID.filter { case (id, name) => existingProducts.contains(id) }.
       values.collect().foreach(println)
-    artistByID.filter { case (id, name) => recommendedProductIDs.contains(id) }.
+    allImageByID.filter { case (id, name) => recommendedProductIDs.contains(id) }.
       values.collect().foreach(println)
 
     unpersist(model)
@@ -196,11 +199,11 @@ object RunRecommender {
 
   def evaluate(
       sc: SparkContext,
-      rawUserArtistData: RDD[String],
-      rawArtistAlias: RDD[String]): Unit = {
-    val bArtistAlias = sc.broadcast(buildArtistAlias(rawArtistAlias))
+      rddevent: RDD[(String, scala.collection.Map[String,AnyRef])],
+      rddimg: RDD[(String, scala.collection.Map[String,AnyRef])]): Unit = {
+   
 
-    val allData = buildRatings(rawUserArtistData, bArtistAlias)
+    val allData = buildEventRating(rddevent)
     val Array(trainData, cvData) = allData.randomSplit(Array(0.9, 0.1))
     trainData.cache()
     cvData.cache()
@@ -230,22 +233,21 @@ object RunRecommender {
 
   def recommend(
       sc: SparkContext,
-      rawUserArtistData: RDD[String],
-      rawArtistData: RDD[String],
-      rawArtistAlias: RDD[String]): Unit = {
+      rddevent: RDD[(String, scala.collection.Map[String,AnyRef])],
+      rddimg: RDD[(String, scala.collection.Map[String,AnyRef])]): Unit = {
 
-    val bArtistAlias = sc.broadcast(buildArtistAlias(rawArtistAlias))
-    val allData = buildRatings(rawUserArtistData, bArtistAlias).cache()
+   
+    val allData = buildEventRating(rddevent)
     val model = ALS.trainImplicit(allData, 50, 10, 1.0, 40.0)
     allData.unpersist()
 
-    val userID = 2093760
+    val userID = 100
     val recommendations = model.recommendProducts(userID, 5)
     val recommendedProductIDs = recommendations.map(_.product).toSet
 
-    val artistByID = buildArtistByID(rawArtistData)
+    val imageByID = buildImageByID(rddimg)
 
-    artistByID.filter { case (id, name) => recommendedProductIDs.contains(id) }.
+    imageByID.filter { case (id, name) => recommendedProductIDs.contains(id) }.
        values.collect().foreach(println)
 
     val someUsers = allData.map(_.user).distinct().take(100)
@@ -253,7 +255,7 @@ object RunRecommender {
     someRecommendations.map(
       recs => recs.head.user + " -> " + recs.map(_.product).mkString(", ")
     ).foreach(println)
-
+    someRecommendations.saveToEs("demo/recommends")
     unpersist(model)
   }
 
